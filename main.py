@@ -3,7 +3,7 @@ import akshare as ak
 from datetime import datetime, timedelta
 import numpy as np
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 from sklearn.preprocessing import MinMaxScaler
 import os
 
@@ -47,34 +47,99 @@ class DataHandler:
         return df
 
     def add_technical_indicators(self, df):
-        # 添加技术指标（例如移动平均）
+        # 添加技术指标
         df['ma5'] = df['close'].rolling(window=5).mean()  # 5日移动平均
         df['ma20'] = df['close'].rolling(window=20).mean()  # 20日移动平均
+        df['rsi'] = self.calculate_rsi(df['close'])  # RSI指标
+        df['macd'], df['signal'], df['hist'] = self.calculate_macd(df['close'])  # MACD指标
+        df['upper'], df['middle'], df['lower'] = self.calculate_bollinger_bands(df['close'])  # 布林带
+        df['cci'] = self.calculate_cci(df['high'], df['low'], df['close'])  # CCI指标
         return df
+
+    def calculate_rsi(self, prices, period=14):
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    def calculate_macd(self, prices, slow=26, fast=12, signal=9):
+        exp1 = prices.ewm(span=fast, adjust=False).mean()
+        exp2 = prices.ewm(span=slow, adjust=False).mean()
+        macd = exp1 - exp2
+        signal_line = macd.ewm(span=signal, adjust=False).mean()
+        histogram = macd - signal_line
+        return macd, signal_line, histogram
+
+    def calculate_bollinger_bands(self, prices, window=20, num_std=2):
+        middle = prices.rolling(window=window).mean()
+        std = prices.rolling(window=window).std()
+        upper = middle + (std * num_std)
+        lower = middle - (std * num_std)
+        return upper, middle, lower
+
+    def calculate_cci(self, high, low, close, period=20):
+        tp = (high + low + close) / 3
+        sma = tp.rolling(window=period).mean()
+        # 使用更新的方法计算平均绝对偏差
+        mad = tp.rolling(window=period).apply(lambda x: abs(x - x.mean()).mean())
+        cci = (tp - sma) / (0.015 * mad)
+        return cci
 
 
 class ModelTrainer:
     def __init__(self, input_shape, output_shape):
         self.input_shape = input_shape
         self.output_shape = output_shape
-        self.model = None  # 初始化时模型为 None，防止引用未定义的模型
+        self.model = None
 
     def build_model(self):
+        from tensorflow.keras.optimizers import Adam
+        from tensorflow.keras.regularizers import l2
+        
         model = Sequential([
-            LSTM(50, input_shape=self.input_shape, return_sequences=True),
-            LSTM(25),
+            LSTM(100, input_shape=self.input_shape, return_sequences=True, 
+                 kernel_regularizer=l2(0.01), recurrent_regularizer=l2(0.01)),
+            Dropout(0.2),
+            LSTM(50, kernel_regularizer=l2(0.01), recurrent_regularizer=l2(0.01)),
+            Dropout(0.2),
+            Dense(25, activation='relu', kernel_regularizer=l2(0.01)),
+            Dropout(0.1),
             Dense(self.output_shape)
         ])
-        model.compile(optimizer='adam', loss='mean_squared_error')
+        
+        optimizer = Adam(learning_rate=0.001, clipnorm=1.0)
+        model.compile(optimizer=optimizer, loss='mean_squared_error')
         return model
 
-    def train_model(self, X_train, y_train, epochs=100, batch_size=32):
-        # 如果 model 已经存在，先删除原模型
+    def save_model(self, stock_code):
+        if self.model is None:
+            raise ValueError("No model to save. Please train the model first.")
+        
+        # 创建模型保存目录
+        model_dir = 'saved_models'
+        if not os.path.exists(model_dir):
+            os.makedirs(model_dir)
+        
+        # 生成包含股票代码和时间戳的文件名
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        model_path = os.path.join(model_dir, f'{stock_code}_model_{timestamp}.keras')
+        
+        # 保存模型
+        self.model.save(model_path)
+        print(f'模型已保存到：{model_path}')
+
+    def train_model(self, X_train, y_train, sample_weights=None, epochs=100, batch_size=32, callbacks=None):
         if self.model is not None:
             del self.model
 
-        self.model = self.build_model()  # 构建并保存模型
-        history = self.model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=1)
+        self.model = self.build_model()
+        history = self.model.fit(X_train, y_train, 
+                               sample_weight=sample_weights,
+                               epochs=epochs, 
+                               batch_size=batch_size, 
+                               callbacks=callbacks,
+                               verbose=1)
         return history
 
     def predict(self, X_test):
@@ -87,57 +152,126 @@ class AutoTrader:
     def __init__(self, stock_code, balance=100000):
         self.stock_code = stock_code
         self.balance = balance
-
-        # 初始化数据
         self.data_handler = DataHandler(stock_code)
-        df = self.data_handler.get_data()
-        self.df = df
-
-        # 准备数据
-        self.prepare_data()
+        self.df = None
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
 
     def prepare_data(self):
-        # 添加技术指标
-        self.df = self.data_handler.add_technical_indicators(self.df)
+        if self.df is None:
+            # 获取最近3个月的数据
+            end_date = datetime.now().strftime('%Y%m%d')
+            start_date = (datetime.now() - timedelta(days=90)).strftime('%Y%m%d')
+            self.df = self.data_handler.get_data(start_date=start_date, end_date=end_date)
+            self.df = self.data_handler.add_technical_indicators(self.df)
 
-        # 使用MinMaxScaler对数据进行归一化处理
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        self.df[['close', 'volume', 'ma5', 'ma20']] = scaler.fit_transform(self.df[['close', 'volume', 'ma5', 'ma20']])
+        # 添加KDJ指标
+        self.df['K'], self.df['D'], self.df['J'] = self.calculate_kdj(self.df)
+        
+        # 添加短周期RSI
+        self.df['rsi_5'] = self.calculate_rsi(self.df['close'], period=5)
+        self.df['rsi_9'] = self.calculate_rsi(self.df['close'], period=9)
 
-        # 提取特征和标签
-        X = self.df[['close', 'volume', 'ma5', 'ma20']].values
-        y = self.df['close'].shift(-1).dropna().values  # 预测下一个收盘价
-        X = X[:-1]  # 对应调整X的长度
+        # 选择特征列，包含新增的短期指标
+        feature_columns = ['close', 'volume', 'ma5', 'ma20', 'rsi', 'rsi_5', 'rsi_9',
+                          'macd', 'signal', 'hist', 'upper', 'middle', 'lower',
+                          'cci', 'price_change_rate', 'K', 'D', 'J']
 
-        # 将数据转换为LSTM需要的格式：样本数量，时间步长，特征数量
-        X = X.reshape(X.shape[0], 1, X.shape[1])  # 1时间步
+        # 删除包含NaN的行
+        self.df = self.df.dropna()
 
-        return X, y
+        # 使用StandardScaler对数据进行标准化处理
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        self.df[feature_columns] = scaler.fit_transform(self.df[feature_columns])
 
-    def generate_signals(self, model, X_test):
-        # 预测并生成信号
+        # 创建时间窗口特征，使用较短的时间窗口
+        window_size = 5  # 减小窗口大小以更好地捕捉短期特征
+        X = []
+        y = []
+        weights = []
+
+        for i in range(len(self.df) - window_size):
+            X.append(self.df[feature_columns].values[i:(i + window_size)])
+            y.append(self.df['close'].values[i + window_size])
+            # 添加时间衰减权重，最近的数据权重更大
+            weight = np.exp(-0.1 * (len(self.df) - window_size - i))
+            weights.append(weight)
+
+        X = np.array(X)
+        y = np.array(y)
+        weights = np.array(weights)
+
+        # 划分训练集和验证集
+        train_size = int(len(X) * 0.8)
+        X_train = X[:train_size]
+        y_train = y[:train_size]
+        sample_weights = weights[:train_size]
+
+        return X_train, y_train, sample_weights
+
+    def calculate_kdj(self, df, n=9, m1=3, m2=3):
+        low_list = df['low'].rolling(window=n, min_periods=1).min()
+        high_list = df['high'].rolling(window=n, min_periods=1).max()
+        rsv = (df['close'] - low_list) / (high_list - low_list) * 100
+
+        K = rsv.ewm(com=m1-1, adjust=False).mean()
+        D = K.ewm(com=m2-1, adjust=False).mean()
+        J = 3 * K - 2 * D
+
+        return K, D, J
+
+    def calculate_rsi(self, prices, period):
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    def generate_signals(self, model, X_test, future_dates):
         try:
             y_pred = model.predict(X_test)
+            # 添加预测值的置信度阈值
+            confidence_threshold = 0.02  # 2%的变化阈值
+            
+            signals = []
+            prev_signal = '持有'  # 记录前一个信号
+            
+            # 创建预测结果DataFrame
+            results_df = pd.DataFrame({
+                'date': future_dates,
+                'predicted_price': y_pred.flatten(),
+                'actual_price': [self.df['close'].iloc[-1]] * len(y_pred)  # 使用最新的实际价格
+            })
+            
+            for i in range(1, len(y_pred)):
+                price_change = (y_pred[i] - y_pred[i - 1]) / y_pred[i - 1]
+                
+                # 根据价格变化幅度和前一个信号来决定交易信号
+                if price_change > confidence_threshold and prev_signal != '买入':
+                    signals.append('买入')
+                    prev_signal = '买入'
+                elif price_change < -confidence_threshold and prev_signal != '卖出':
+                    signals.append('卖出')
+                    prev_signal = '卖出'
+                else:
+                    signals.append('持有')
+                    prev_signal = '持有'
+            
+            # 添加交易信号到结果DataFrame
+            results_df['signal'] = ['持有'] + signals  # 第一个信号设为'持有'
+            
+            # 保存预测结果到CSV文件
+            results_file = os.path.join(self.data_handler.data_dir, f'{self.stock_code}_predictions.csv')
+            results_df.to_csv(results_file, index=False)
+            print(f'预测结果已保存到：{results_file}')
+                    
+            return signals
         except Exception as e:
             print(f"Error during prediction: {e}")
-            print(f"X_test types: {X_test.dtypes}")
-            print(f"X_test shape: {X_test.shape}")
-
-        signals = []
-
-        for i in range(1, len(y_pred)):
-            if y_pred[i] > y_pred[i - 1]:
-                signals.append('买入')
-            elif y_pred[i] < y_pred[i - 1]:
-                signals.append('卖出')
-            else:
-                signals.append('持有')
-
-        return signals
+            return []
 
     def execute_trade(self, signals):
         current_price = self.df['close'].iloc[-1]
-
         for signal in signals:
             if signal == '买入':
                 shares_bought = self.balance // current_price
@@ -151,48 +285,53 @@ class AutoTrader:
             else:
                 print("持有，无交易")
 
-    def download_data(self, start_date=None, end_date=None):
-        self.df = self.data_handler.get_data(start_date=start_date, end_date=end_date)
-        if self.df.empty:
-            raise ValueError("No data downloaded")
-        self.prepare_data()
-
 
 if __name__ == "__main__":
-    # 示例使用
-    stock_code = "603777"  # 替换为实际股票代码
+    stock_code = "603777"
     balance = 100000
 
     auto_trader = AutoTrader(stock_code, balance)
-    auto_trader.download_data()  # 设置下载时间范围，确保有足够的数据用于训练和测试
+    X_train, y_train, sample_weights = auto_trader.prepare_data()
 
-    # 训练模型
-    X_train, y_train = auto_trader.prepare_data()
     model_trainer = ModelTrainer(input_shape=(X_train.shape[1], X_train.shape[2]), output_shape=1)
-    history = model_trainer.train_model(X_train, y_train)
+    # 添加early stopping回调
+    from tensorflow.keras.callbacks import EarlyStopping
+    early_stopping = EarlyStopping(
+        monitor='loss',
+        patience=20,  # 如果20个epoch内loss没有改善，则停止训练
+        min_delta=0.0001,  # loss改善的最小阈值
+        restore_best_weights=True  # 恢复最佳权重
+    )
+    
+    # 增加训练轮次并添加early stopping
+    history = model_trainer.train_model(
+        X_train, 
+        y_train, 
+        sample_weights=sample_weights,
+        epochs=300,  # 增加最大训练轮次
+        callbacks=[early_stopping]
+    )
+    
+    # 保存训练好的模型
+    model_trainer.save_model(stock_code)
 
-    # 使用模型生成信号
-    future_dates = pd.date_range(start=auto_trader.df['date'].max() + pd.Timedelta(days=1),
-                                 end=auto_trader.df['date'].max() + pd.Timedelta(days=30))
-    future_df = pd.DataFrame(index=future_dates, columns=['date', 'close', 'volume', 'ma5', 'ma20'])
-    future_df['date'] = future_df.index
-    future_df['date'] = pd.to_datetime(future_df['date'])
+    # 准备未来数据
+    future_dates = pd.date_range(
+        start=auto_trader.df['date'].max() + pd.Timedelta(days=1),
+        end=auto_trader.df['date'].max() + pd.Timedelta(days=30)
+    )
 
-    # 获取未来数据并确保数据类型正确
-    future_df[['close', 'volume']] = np.nan  # 填充为 NaN，表示未来的价格和交易量不可知
-    X_future = future_df[['close', 'volume', 'ma5', 'ma20']].values
+    # 创建未来数据的特征矩阵
+    feature_columns = ['close', 'volume', 'ma5', 'ma20', 'rsi', 'rsi_5', 'rsi_9',
+                      'macd', 'signal', 'hist', 'upper', 'middle', 'lower',
+                      'cci', 'price_change_rate', 'K', 'D', 'J']
+    future_df = pd.DataFrame(index=future_dates, columns=feature_columns)
+    future_df = future_df.fillna(0)  # 填充为0
 
-    # 强制转换数据类型为 float32（或者 float64）
+    # 转换为模型所需的格式
+    X_future = future_df.values.reshape(future_df.shape[0], 1, len(feature_columns))
     X_future = X_future.astype('float32')
 
-    # 填充缺失的 NaN 值（如果有的话）
-    X_future = np.nan_to_num(X_future, nan=0.0)
-
-    # 调整形状为三维输入 (样本数, 时间步数, 特征数)
-    X_future = X_future.reshape(X_future.shape[0], 1, X_future.shape[1])
-
-    # 使用训练好的模型生成信号
-    signals = auto_trader.generate_signals(model_trainer.model, X_future)
-
-    # 执行交易
+    # 生成交易信号并执行交易
+    signals = auto_trader.generate_signals(model_trainer.model, X_future, future_dates)
     auto_trader.execute_trade(signals)
